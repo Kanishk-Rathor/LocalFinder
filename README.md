@@ -404,7 +404,8 @@ document.addEventListener('DOMContentLoaded', () => {
             });
             if (!response.ok) throw new Error(`HTTP error! status: ${response.status}`);
             const result = await response.json();
-            return result.candidates?.[0]?.content?.parts?.[0]?.text || "Sorry, I couldn't process that request.";
+            const text = result.candidates?.[0]?.content?.parts?.[0]?.text;
+            return text || "Sorry, I couldn't process that request.";
         } catch (error) {
             if (retries > 0) {
                 await new Promise(res => setTimeout(res, delay));
@@ -413,6 +414,12 @@ document.addEventListener('DOMContentLoaded', () => {
             console.error("Error calling Gemini API:", error);
             return "An error occurred while contacting the AI. Please try again later.";
         }
+    }
+
+    function parseSimpleMarkdown(text) {
+        return text
+            .replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>') // Bold
+            .replace(/\n/g, '<br>'); // Newlines
     }
 
     let navHtml = '<ul class="space-y-4">';
@@ -509,7 +516,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
     document.querySelector('.nav-link[data-target="introduction"]').click();
 
-    document.body.addEventListener('click', async (e) => {
+    document.body.addEventListener('click', (e) => {
         const copyBtn = e.target.closest('.copy-btn');
         const explainBtn = e.target.closest('.explain-btn');
         const generateBtn = e.target.closest('.generate-code-btn');
@@ -518,11 +525,21 @@ document.addEventListener('DOMContentLoaded', () => {
             const pre = copyBtn.nextElementSibling;
             const code = pre.querySelector('code');
             if (code) {
+                const textarea = document.createElement('textarea');
+                textarea.value = code.innerText;
+                textarea.style.position = 'absolute';
+                textarea.style.left = '-9999px';
+                document.body.appendChild(textarea);
+                textarea.select();
                 try {
-                    await navigator.clipboard.writeText(code.innerText);
+                    document.execCommand('copy');
                     copyBtn.textContent = 'Copied!';
-                    setTimeout(() => { copyBtn.textContent = 'Copy'; }, 2000);
-                } catch (err) { console.error('Failed to copy text: ', err); }
+                } catch (err) {
+                    copyBtn.textContent = 'Error';
+                    console.error('Failed to copy text: ', err);
+                }
+                document.body.removeChild(textarea);
+                setTimeout(() => { copyBtn.textContent = 'Copy'; }, 2000);
             }
         }
 
@@ -532,9 +549,10 @@ document.addEventListener('DOMContentLoaded', () => {
             modal.classList.remove('hidden');
             modal.classList.add('flex');
             modalContent.innerHTML = '<div class="flex justify-center items-center p-8"><div class="loader"></div></div>';
-            const prompt = `Explain the following API endpoint in simple terms for a new developer. What does it do and when would you use it? Keep it concise and use markdown for formatting. Endpoint details: ${JSON.stringify(endpoint)}`;
-            const explanation = await callGemini(prompt);
-            modalContent.innerHTML = explanation.replace(/\n/g, '<br>'); // Basic markdown
+            const prompt = `Explain the following API endpoint in simple terms for a new developer. What does it do and when would you use it? Keep it concise and use markdown for formatting (like **bold** text). Endpoint details: ${JSON.stringify(endpoint)}`;
+            callGemini(prompt).then(explanation => {
+                modalContent.innerHTML = parseSimpleMarkdown(explanation);
+            });
         }
 
         if(generateBtn) {
@@ -547,9 +565,10 @@ document.addEventListener('DOMContentLoaded', () => {
             container.innerHTML = '<div class="flex justify-center items-center p-8"><div class="loader"></div></div>';
             
             const prompt = `Generate a code snippet in ${language} for the following API endpoint. The snippet should make a ${endpoint.method} request to a base URL + "${endpoint.path}". If a request body is needed, use this structure as an example: ${JSON.stringify(endpoint.request)}. Include comments explaining the code. Respond only with the code block.`;
-            let code = await callGemini(prompt);
-            code = code.replace(/```[a-z]*\n/g, '').replace(/```/g, ''); // Clean up markdown fences
-            container.innerHTML = `<div class="relative mt-2"><button class="copy-btn absolute top-2 right-2 bg-slate-700 text-white text-xs px-2 py-1 rounded">Copy</button><pre class="bg-slate-800 text-white p-4 rounded-md text-sm overflow-x-auto"><code>${code}</code></pre></div>`;
+            callGemini(prompt).then(code => {
+                let cleanedCode = code.replace(/^```[a-z]*\n?/, '').replace(/```$/, '');
+                container.innerHTML = `<div class="relative mt-2"><button class="copy-btn absolute top-2 right-2 bg-slate-700 text-white text-xs px-2 py-1 rounded">Copy</button><pre class="bg-slate-800 text-white p-4 rounded-md text-sm overflow-x-auto"><code>${cleanedCode}</code></pre></div>`;
+            });
         }
     });
 
@@ -558,25 +577,37 @@ document.addEventListener('DOMContentLoaded', () => {
         modal.classList.add('hidden');
         modal.classList.remove('flex');
     });
+    modal.addEventListener('click', (e) => {
+        if (e.target === modal) {
+            modal.classList.add('hidden');
+            modal.classList.remove('flex');
+        }
+    });
 
     // AI Search logic
     let searchTimeout;
     searchInput.addEventListener('input', () => {
         clearTimeout(searchTimeout);
-        searchTimeout = setTimeout(async () => {
+        searchTimeout = setTimeout(() => {
             const query = searchInput.value;
             if (query.length < 3) return;
             searchLoader.style.display = 'flex';
-            const prompt = `Given the following list of API endpoints: "${endpointListForAI}". Which single endpoint ID is the most relevant for the user query: "${query}"? Respond with ONLY the endpoint ID (e.g., 'auth-login').`;
-            const resultId = (await callGemini(prompt)).trim();
-            const targetLink = document.querySelector(`.nav-link[data-target="${resultId}"]`);
-            if (targetLink) {
-                targetLink.click();
-                targetLink.scrollIntoView({ behavior: 'smooth', block: 'center' });
-                targetLink.classList.add('highlight');
-                setTimeout(() => targetLink.classList.remove('highlight'), 2000);
-            }
-            searchLoader.style.display = 'none';
+            const prompt = `Given the following list of API endpoints: "${endpointListForAI}". Which single endpoint ID is the most relevant for the user query: "${query}"? Respond with ONLY the endpoint ID string and nothing else (e.g., 'auth-login').`;
+            callGemini(prompt).then(responseText => {
+                let resultId = responseText.trim();
+                const idMatch = resultId.match(/[a-z]+(?:-[a-z]+)+/);
+                if (idMatch) {
+                    resultId = idMatch[0];
+                }
+                const targetLink = document.querySelector(`.nav-link[data-target="${resultId}"]`);
+                if (targetLink) {
+                    targetLink.click();
+                    targetLink.scrollIntoView({ behavior: 'smooth', block: 'center' });
+                    targetLink.classList.add('highlight');
+                    setTimeout(() => targetLink.classList.remove('highlight'), 2000);
+                }
+                 searchLoader.style.display = 'none';
+            });
         }, 1000);
     });
 });
@@ -584,6 +615,7 @@ document.addEventListener('DOMContentLoaded', () => {
 
 </body>
 </html>
+
 
 
 # LocalFinder
